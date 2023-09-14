@@ -1,81 +1,265 @@
-import { App, Editor, MarkdownView, Modal, Notice, Plugin, PluginSettingTab, Setting } from 'obsidian';
+import {
+	App,
+	Notice,
+	Plugin, PluginSettingTab,
+	requestUrl, RequestUrlParam,
+	Setting,
+	TFile, TFolder,
+	Vault
+} from "obsidian";
+import moment from "moment";
+import dedent from "dedent";
 
-// Remember to rename these classes and interfaces!
+moment.updateLocale("ru", {
+	week: {
+		dow: 1
+	}
+});
 
-interface MyPluginSettings {
-	mySetting: string;
+// Время поездки: отдельно туда и обратно
+interface CommuteTime {
+	forwards: string;
+	backwards: string;
 }
 
-const DEFAULT_SETTINGS: MyPluginSettings = {
-	mySetting: 'default'
+// Настройки плагина
+interface MtuciTimetableSettings {
+	apiKey: string;
+	generateCommute: boolean;
+	path: string;
+	commute: {
+		OP: CommuteTime;
+		A: CommuteTime;
+	};
 }
 
-export default class MyPlugin extends Plugin {
-	settings: MyPluginSettings;
+// Настройки по умолчанию
+const DEFAULT_SETTINGS: MtuciTimetableSettings = {
+	apiKey: "",
+	generateCommute: true,
+	path: "календарь/мтуси",
+	commute: {
+		OP: { forwards: "", backwards: "" },
+		A: { forwards: "", backwards: "" },
+	}
+}
+
+enum SubjectType {
+	LECTURE = 1,
+	PRACTICE = 2,
+	LAB = 3
+}
+
+// Объект расписания
+type Timetable = {
+	day: number,
+	parity: 1 | 2,
+	lessons: Record<number, {
+		audience: string[],
+		day: number,
+		discipline: [string],
+		number: number,
+		teacher: string[],
+		time_start: string,
+		time_end: string,
+		type: SubjectType
+	}>
+}[];
+
+// Обработанный объект расписания только с интересующей нас информацией
+enum Building {
+	OP = 1,
+	A = 2
+}
+type CompressedTimetable = {
+	day: number,
+	parity: 1 | 2,
+	time_start: string,
+	time_end: string,
+	building: Building
+}[];
+
+export default class MtuciTimetablePlugin extends Plugin {
+	settings: MtuciTimetableSettings;
+
+	async apiRequest(endpoint: string, params?: RequestUrlParam) {
+		const request = {
+			...params,
+			url: `https://apimtuci.ru/${endpoint}`,
+		};
+		const response = await requestUrl(request);
+		console.log("mtuci: apiRequest", request, response);
+		return response;
+	}
+
+	extractCookie(cookies: string[], cookie: string) {
+		return decodeURIComponent(cookies
+			.find((v) => v.startsWith(cookie))
+			?.split(";")[0]
+			.split("=")[1]
+			?? "");
+	}
+
+	async getTimetable() {
+		console.log("mtuci: getTimetable");
+
+		// Получаем изначальные куки
+		let response = await this.apiRequest("web");
+		let cookies = response.headers["set-cookie"] as unknown as string[];
+		const xsrfToken = this.extractCookie(cookies, "XSRF-TOKEN");
+		const session = this.extractCookie(cookies, "mtusi_tech_session");
+		
+		// Формируем контекст с заголовками
+		const context = {
+			url: "blah",
+			headers: {
+				"Cookie": `XSRF-TOKEN=${xsrfToken}; mtusi_tech_session=${session}`,
+				"X-XSRF-TOKEN": xsrfToken
+			}
+		};
+
+		// Авторизуемся
+		response = await this.apiRequest(`api/web/token/validate?token=${this.settings.apiKey}`, {
+			...context,
+			method: "POST"
+		});
+		cookies = response.headers["set-cookie"] as unknown as string[];
+		const token = this.extractCookie(cookies, "token");
+		context.headers["Cookie"] += `; token=${token}`;
+
+		// Получаем данные
+		const json = (await this.apiRequest("api/web/get", context)).json;
+		const timetable = json.content.timetable.content.timetable as Timetable;
+
+		return [timetable, json.content.parity]; // расписание и чётность текущей недели
+	}
+
+	compressTimetable(timetable: Timetable): CompressedTimetable {
+		// @ts-expect-error мы убрали undefined при помощи filter
+		return timetable
+			.map((entry) => ({
+				day: entry.day,
+				parity: entry.parity,
+				time_start: Object.values(entry.lessons)
+					.find((x) => x.time_start !== "--")?.time_start,
+				time_end: Object.values(entry.lessons)
+					.findLast((x) => x.time_end !== "--")?.time_end,
+				building: (Object.values(entry.lessons)
+					.find((x) => x.audience[0] !== "--")?.audience[0].includes("ОП"))
+					? Building.OP : Building.A
+			}))
+			.filter((entry) => entry.time_start !== undefined && entry.time_end !== undefined);
+	}
+
+	async reloadTimetable() {
+		console.log("mtuci: reloadTimetable");
+
+		let table: Timetable = [];
+		let parity = 0;
+		try {
+			[table, parity] = await this.getTimetable();
+		} catch(ex) {
+			console.error(ex);
+			new Notice("Не удалось загрузить расписание. Проверьте подключение к интернету и правильность токена в настройках плагина.");
+			return;
+		}
+		console.table(table);
+
+		// Выделяем нужную нам информацию
+		const compTable = this.compressTimetable(table);
+		console.table(compTable);
+
+		// // Удаляем старые заметки
+		// const oldDir = this.app.vault.getAbstractFileByPath(this.settings.path) as TFolder;
+		// if(oldDir && !oldDir.isRoot()) {
+		// 	for(const f of oldDir.children) {
+		// 		this.app.vault.delete(f);
+		// 	}
+		// }
+
+		// // Создаём новую структуру
+		// this.app.vault.createFolder(`${this.settings.path}/учёба`);
+		// this.app.vault.createFolder(`${this.settings.path}/дорога`);
+
+		// Определяем временные рамки
+		const thisMonday = moment().locale("ru").startOf("week");
+
+		// Удаляем заметки на эту и следующую неделю
+		for(let i = 0; i < 14; i++) {
+			const name = thisMonday.clone().add(i, "days").format("YYYY-MM-DD");
+			for (const [folder, suffix] of [["учёба", ""], ["дорога", "-1"], ["дорога", "-2"]]) {
+				const file = this.app.vault.getAbstractFileByPath(`${this.settings.path}/${folder}/${name}${suffix}.md`);
+				if(file)
+					this.app.vault.delete(file);
+			}
+		}
+
+		// Создаём заметки на эту и следующую неделю
+		for(const entry of compTable) {
+			// Оборачиваем чётность, если сейчас чётная неделя
+			if(parity === 2)
+				entry.parity = (entry.parity === 1) ? 2 : 1;
+
+			// Заметка с учёбой
+			const offs = entry.day - 1 + ((entry.parity - 1) * 7);
+			const date = thisMonday.clone().add(offs, "days").format("YYYY-MM-DD");
+			this.app.vault.create(`${this.settings.path}/учёба/${date}.md`,
+				dedent`---
+				title: "Учёба (${entry.building == Building.OP ? "ОП" : "А"})"
+				allDay: false
+				startTime: ${entry.time_start}
+				endTime: ${entry.time_end}
+				date: ${date}
+				completed: null
+				---`);
+			
+			if(this.settings.generateCommute) {
+				const commute = this.settings.commute[entry.building == Building.OP ? "OP" : "A"];
+
+				// Заметка с дорогой туда
+				const commuteStart = moment(entry.time_start, "HH:mm")
+					.subtract(moment.duration(commute.forwards));
+				this.app.vault.create(`${this.settings.path}/дорога/${date}-1.md`,
+					dedent`---
+					title: "Дорога"
+					allDay: false
+					startTime: ${commuteStart.format("HH:mm")}
+					endTime: ${entry.time_start}
+					date: ${date}
+					completed: null
+					---`);
+
+				// Заметка с дорогой обратно
+				const commuteEnd = moment(entry.time_end, "HH:mm")
+					.add(moment.duration(commute.backwards));
+				this.app.vault.create(`${this.settings.path}/дорога/${date}-2.md`,
+					dedent`---
+					title: "Дорога"
+					allDay: false
+					startTime: ${entry.time_end}
+					endTime: ${commuteEnd.format("HH:mm")}
+					date: ${date}
+					completed: null
+					---`);
+			}
+		}
+	}
 
 	async onload() {
 		await this.loadSettings();
 
-		// This creates an icon in the left ribbon.
-		const ribbonIconEl = this.addRibbonIcon('dice', 'Sample Plugin', (evt: MouseEvent) => {
-			// Called when the user clicks the icon.
-			new Notice('This is a notice!');
-		});
-		// Perform additional things with the ribbon
-		ribbonIconEl.addClass('my-plugin-ribbon-class');
+		// Кнопка на левой панели (в меню на мобильных устройствах)
+		this.addRibbonIcon("refresh-cw", "Обновить расписание", () => this.reloadTimetable());
 
-		// This adds a status bar item to the bottom of the app. Does not work on mobile apps.
-		const statusBarItemEl = this.addStatusBarItem();
-		statusBarItemEl.setText('Status Bar Text');
-
-		// This adds a simple command that can be triggered anywhere
+		// Команда в палитре
 		this.addCommand({
-			id: 'open-sample-modal-simple',
-			name: 'Open sample modal (simple)',
-			callback: () => {
-				new SampleModal(this.app).open();
-			}
-		});
-		// This adds an editor command that can perform some operation on the current editor instance
-		this.addCommand({
-			id: 'sample-editor-command',
-			name: 'Sample editor command',
-			editorCallback: (editor: Editor, view: MarkdownView) => {
-				console.log(editor.getSelection());
-				editor.replaceSelection('Sample Editor Command');
-			}
-		});
-		// This adds a complex command that can check whether the current state of the app allows execution of the command
-		this.addCommand({
-			id: 'open-sample-modal-complex',
-			name: 'Open sample modal (complex)',
-			checkCallback: (checking: boolean) => {
-				// Conditions to check
-				const markdownView = this.app.workspace.getActiveViewOfType(MarkdownView);
-				if (markdownView) {
-					// If checking is true, we're simply "checking" if the command can be run.
-					// If checking is false, then we want to actually perform the operation.
-					if (!checking) {
-						new SampleModal(this.app).open();
-					}
-
-					// This command will only show up in Command Palette when the check function returns true
-					return true;
-				}
-			}
+			id: "mtuci-timetable-update",
+			name: "Обновить расписание",
+			callback: () => this.reloadTimetable()
 		});
 
-		// This adds a settings tab so the user can configure various aspects of the plugin
-		this.addSettingTab(new SampleSettingTab(this.app, this));
-
-		// If the plugin hooks up any global DOM events (on parts of the app that doesn't belong to this plugin)
-		// Using this function will automatically remove the event listener when this plugin is disabled.
-		this.registerDomEvent(document, 'click', (evt: MouseEvent) => {
-			console.log('click', evt);
-		});
-
-		// When registering intervals, this function will automatically clear the interval when the plugin is disabled.
-		this.registerInterval(window.setInterval(() => console.log('setInterval'), 5 * 60 * 1000));
+		// Вкладка с настройками
+		this.addSettingTab(new MtuciTimetableSettingTab(this.app, this));
 	}
 
 	onunload() {
@@ -91,26 +275,10 @@ export default class MyPlugin extends Plugin {
 	}
 }
 
-class SampleModal extends Modal {
-	constructor(app: App) {
-		super(app);
-	}
+class MtuciTimetableSettingTab extends PluginSettingTab {
+	plugin: MtuciTimetablePlugin;
 
-	onOpen() {
-		const {contentEl} = this;
-		contentEl.setText('Woah!');
-	}
-
-	onClose() {
-		const {contentEl} = this;
-		contentEl.empty();
-	}
-}
-
-class SampleSettingTab extends PluginSettingTab {
-	plugin: MyPlugin;
-
-	constructor(app: App, plugin: MyPlugin) {
+	constructor(app: App, plugin: MtuciTimetablePlugin) {
 		super(app, plugin);
 		this.plugin = plugin;
 	}
@@ -121,14 +289,52 @@ class SampleSettingTab extends PluginSettingTab {
 		containerEl.empty();
 
 		new Setting(containerEl)
-			.setName('Setting #1')
-			.setDesc('It\'s a secret')
+			.setName("Токен API")
+			.setDesc("todo: добавить ссылку на приложуху")
 			.addText(text => text
-				.setPlaceholder('Enter your secret')
-				.setValue(this.plugin.settings.mySetting)
+				.setPlaceholder("с3kР3тн0")
+				.setValue(this.plugin.settings.apiKey)
 				.onChange(async (value) => {
-					this.plugin.settings.mySetting = value;
+					this.plugin.settings.apiKey = value;
 					await this.plugin.saveSettings();
 				}));
+
+		new Setting(containerEl)
+			.setName("Добавлять в календарь время поездки")
+			.addToggle(toggle => toggle
+				.setValue(this.plugin.settings.generateCommute)
+				.onChange(async (value) => {
+					this.plugin.settings.generateCommute = value;
+					await this.plugin.saveSettings();
+				}));
+
+		// Время поездок в корпуса
+		function addCommuteTimeFields(
+			setting: Setting,
+			key: keyof MtuciTimetableSettings["commute"],
+			plugin: MtuciTimetablePlugin
+		) {
+			setting
+				.addMomentFormat(moment => moment
+					.setDefaultFormat("HH:mm")
+					.setPlaceholder("в корпус (чч:мм)")
+					.setValue(plugin.settings.commute[key].forwards)
+					.onChange(async (value) => {
+						plugin.settings.commute[key].forwards = value;
+						await plugin.saveSettings();
+					}))
+				.addMomentFormat(moment => moment
+					.setDefaultFormat("HH:mm")
+					.setPlaceholder("домой (чч:мм)")
+					.setValue(plugin.settings.commute[key].backwards)
+					.onChange(async (value) => {
+						plugin.settings.commute[key].backwards = value;
+						await plugin.saveSettings();
+					}));
+		}
+		addCommuteTimeFields(new Setting(containerEl)
+			.setName("Время поездки на ОП"), "OP", this.plugin);
+		addCommuteTimeFields(new Setting(containerEl)
+			.setName("Время поездки на А"), "A", this.plugin);
 	}
 }

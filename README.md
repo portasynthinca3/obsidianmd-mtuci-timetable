@@ -1,4 +1,6 @@
-# Obsidian Sample Plugin
+# Obsidian.md MTUCI timetable
+
+Подгружает расписание занятий из API MTUCI/TECH в хранилище Obsidian. Используйте с плагином Full Calendar.
 
 This is a sample plugin for Obsidian (https://obsidian.md).
 
