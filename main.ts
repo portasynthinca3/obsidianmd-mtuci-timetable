@@ -3,13 +3,28 @@ import {
 	Notice,
 	Plugin, PluginSettingTab,
 	requestUrl, RequestUrlParam,
-	Setting,
-	TFile, TFolder,
-	Vault
+	Setting
 } from "obsidian";
 import moment from "moment";
 import dedent from "dedent";
 
+// Ручной polyfill
+// @ts-ignore
+if (!Array.prototype.findLast) {
+	// @ts-ignore
+	Array.prototype.findLast = function(callback) {
+		if (!this)
+			throw new TypeError("'this' is null or not defined");
+		const arr = Object(this);
+		const len = arr.length >>> 0;
+		for (let i = len - 1; i >= 0; i--)
+			if (callback(arr[i], i, arr))
+				return arr[i];
+		return undefined;
+	};
+}
+
+// У нас недели начинаются с понедельника
 moment.updateLocale("ru", {
 	week: {
 		dow: 1
@@ -134,6 +149,10 @@ export default class MtuciTimetablePlugin extends Plugin {
 		return [timetable, json.content.parity]; // расписание и чётность текущей недели
 	}
 
+	// "Сжимает" расписание - для каждого дня выделяет:
+	//   - время начала первой пары
+	//   - время окончания последней пары
+	//   - корпус
 	compressTimetable(timetable: Timetable): CompressedTimetable {
 		// @ts-expect-error мы убрали undefined при помощи filter
 		return timetable
@@ -143,6 +162,7 @@ export default class MtuciTimetablePlugin extends Plugin {
 				time_start: Object.values(entry.lessons)
 					.find((x) => x.time_start !== "--")?.time_start,
 				time_end: Object.values(entry.lessons)
+				// @ts-expect-error мы сделали polyfill
 					.findLast((x) => x.time_end !== "--")?.time_end,
 				building: (Object.values(entry.lessons)
 					.find((x) => x.audience[0] !== "--")?.audience[0].includes("ОП"))
@@ -160,7 +180,7 @@ export default class MtuciTimetablePlugin extends Plugin {
 			[table, parity] = await this.getTimetable();
 		} catch(ex) {
 			console.error(ex);
-			new Notice("Не удалось загрузить расписание. Проверьте подключение к интернету и правильность токена в настройках плагина.");
+			new Notice("Не удалось загрузить расписание. Проверьте подключение к Интернету и правильность токена в настройках плагина.");
 			return;
 		}
 		console.table(table);
@@ -169,19 +189,11 @@ export default class MtuciTimetablePlugin extends Plugin {
 		const compTable = this.compressTimetable(table);
 		console.table(compTable);
 
-		// // Удаляем старые заметки
-		// const oldDir = this.app.vault.getAbstractFileByPath(this.settings.path) as TFolder;
-		// if(oldDir && !oldDir.isRoot()) {
-		// 	for(const f of oldDir.children) {
-		// 		this.app.vault.delete(f);
-		// 	}
-		// }
+		// Создаём структуру. Ничего страшного, если она уже есть
+		try { await this.app.vault.createFolder(`${this.settings.path}/учёба`); } catch(ex) {  }
+		try { await this.app.vault.createFolder(`${this.settings.path}/дорога`); } catch(ex) {  }
 
-		// // Создаём новую структуру
-		// this.app.vault.createFolder(`${this.settings.path}/учёба`);
-		// this.app.vault.createFolder(`${this.settings.path}/дорога`);
-
-		// Определяем временные рамки
+		// Получаем понедельник этой недели
 		const thisMonday = moment().locale("ru").startOf("week");
 
 		// Удаляем заметки на эту и следующую неделю
@@ -243,6 +255,8 @@ export default class MtuciTimetablePlugin extends Plugin {
 					---`);
 			}
 		}
+
+		new Notice("Расписание успешно обновлено");
 	}
 
 	async onload() {
